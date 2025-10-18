@@ -2,6 +2,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
 import matplotlib.pyplot as plt
+
+from uuv_mission import mission
 from .terrain import generate_reference_and_limits
 
 class Submarine:
@@ -75,8 +77,56 @@ class Mission:
 
     @classmethod
     def from_csv(cls, file_name: str):
-        # You are required to implement this method
-        pass
+        """
+        Load mission data from CSV.
+
+        Expected CSV layout (flexible):
+        - preferred columns: reference, cave_depth, cave_height
+        - fallback: if only two columns exist, treat them as (reference, cave_depth)
+        The method will try data/file_name and file_name directly.
+        """
+        from pathlib import Path
+        import pandas as pd
+        import numpy as np
+
+        p = Path(file_name)
+        # try data/ fallback
+        if not p.exists():
+            alt = Path("data") / p
+            if alt.exists():
+                p = alt
+            else:
+                raise FileNotFoundError(f"Mission file not found: {file_name}")
+
+        df = pd.read_csv(p)
+        # normalise column names
+        df.columns = [c.strip().lower() for c in df.columns]
+
+        # heuristics to parse common layouts
+        if {"reference", "cave_depth", "cave_height"}.issubset(set(df.columns)):
+            reference = pd.to_numeric(df["reference"], errors="coerce").to_numpy()
+            cave_depth = pd.to_numeric(df["cave_depth"], errors="coerce").to_numpy()
+            cave_height = pd.to_numeric(df["cave_height"], errors="coerce").to_numpy()
+        elif {"reference", "depth"}.issubset(set(df.columns)) or df.shape[1] >= 2:
+            # fallback: try (reference, cave_depth) or first two columns
+            if "reference" in df.columns and "depth" in df.columns:
+                reference = pd.to_numeric(df["reference"], errors="coerce").to_numpy()
+                cave_depth = pd.to_numeric(df["depth"], errors="coerce").to_numpy()
+            else:
+                reference = pd.to_numeric(df.iloc[:, 0], errors="coerce").to_numpy()
+                cave_depth = pd.to_numeric(df.iloc[:, 1], errors="coerce").to_numpy()
+            # create a simple cave_height slightly above reference if not present
+            span = float(np.nanmax(cave_depth) - np.nanmin(cave_depth)) if np.isfinite(np.nanmax(cave_depth)) else 1.0
+            cave_height = np.full_like(reference, fill_value=np.max(reference) + abs(span)*0.5)
+        else:
+            raise ValueError("mission CSV must contain at least reference and cave_depth columns")
+
+        if np.isnan(reference).any() or np.isnan(cave_depth).any():
+            raise ValueError("mission.csv contains non-numeric values in required columns")
+
+        return cls(reference=np.asarray(reference),
+                   cave_height=np.asarray(cave_height),
+                   cave_depth=np.asarray(cave_depth))
 
 
 class ClosedLoop:
@@ -97,7 +147,15 @@ class ClosedLoop:
         for t in range(T):
             positions[t] = self.plant.get_position()
             observation_t = self.plant.get_depth()
-            # Call your controller here
+
+            # compute error between reference and measured depth
+            r_t = mission.reference[t]
+            error = r_t - observation_t
+
+            # compute control action using the provided controller
+            actions[t] = self.controller.compute(error)
+
+            # apply action + disturbance to plant and step to next state
             self.plant.transition(actions[t], disturbances[t])
 
         return Trajectory(positions)
